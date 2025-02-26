@@ -1,34 +1,38 @@
 import asyncio
 import websockets
 import json
-from client import AgentMail  # Import the AgentMail client
+from agentmail import AgentMail  # Import the AgentMail client
 from dotenv import load_dotenv
 import os
 load_dotenv()
 
 async def connect_to_agent(email_address: str):
     uri = f"ws://localhost:8000/ws/{email_address}"
-    client = AgentMail(base_url="https://api.agentmail.to/v0", api_key= os.getenv("AGENTMAIL_PROD_API_KEY"))
+    client = AgentMail(api_key= os.getenv("AGENTMAIL_PROD_API_KEY"))
+
+
 
     async with websockets.connect(uri) as websocket:
         print(f"Connected to agent for {email_address}")
         print("Waiting for new emails...")
         while True:
             try:
-                # Check for new emails
-                # print("Checking for new emails...")
-                emails = client.get_emails(email_address)
+                # Checking for new emails
+                messages = client.messages.list(
+                    inbox_id=email_address,
+
+                )
                 
                 # If there are new emails, send notification through websocket
-                if emails.emails:
-                    print(f"Found {len(emails.emails)} emails")
+                if messages.messages:
+                    print(f"Found {len(messages.messages)} emails")
 
                     # creating our own message / notification type sending it to our own server.
                     notification = {
                         "type": "new_email",
                         "data": {
                             "email_address": email_address,
-                            "emails": [{"id": email.id, "subject": email.subject} for email in emails.emails]
+                            "emails": [{"id": message.message_id, "subject": message.subject} for message in messages.messages]
                         }
                     }
                     print(f"Sending notification: {notification}")
@@ -55,6 +59,6 @@ async def connect_to_agent(email_address: str):
                 await asyncio.sleep(5) 
 
 if __name__ == "__main__":
-    email_address = "test_substack@agentmail.to"
+    email_address = "testfinal@agentmail.to"
     print("Starting email monitor...")
     asyncio.run(connect_to_agent(email_address))
