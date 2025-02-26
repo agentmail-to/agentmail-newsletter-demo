@@ -4,14 +4,13 @@ from browser_use.browser.context import BrowserContextConfig
 from playwright.async_api import BrowserContext
 from dotenv import load_dotenv
 from browser_use.controller.service import Controller
-from client import AgentMail
 from typing import Optional, List
 from fastapi import FastAPI, WebSocket
 
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
-
+from agentmail import AgentMail
 
 
 load_dotenv()
@@ -38,33 +37,45 @@ class EmailManager:
     async def connect(self, email_address: str, websocket: WebSocket):
         await websocket.accept()
         self.active_connections[email_address] = websocket
+         # Clear any existing log file
+        log_path = f"logs/conversation_{email_address}.json"
+        if os.path.exists(log_path):
+            os.remove(log_path)
         
         # Create agent instance for this connection
         self.agents[email_address] = Agent(
            task=f"""You are Agent Kelly, an email and web assistant. Your personal email url is {email_address}
+        Do not attempt to create your own inbox. You already have one.
         You must follow these strict rules:
         1. ALWAYS use the provided tool calls for ANY email operations - never try to access emails directly via URLs
-        2. Use 'Get all emails' tool to check for new emails
-        3. When you receive emails, first get their IDs from the emails.emails list returned by 'Get all emails'
-        4. When you find the Newsletter Signup Request email, read it by calling 'Get email content' with the email ID.
-        5. Use the browser-aware 'Sign up for newsletter' tool for each brand's website. When you do scroll to the very bottom of the page, usually 5000px. The newsletter signup button is usually there.
-        6. Be sure to not click the check box to confirm before clicking submit since it is already checked.
-        6. Use 'reply_to_email' tool to reply to the original email with promotions. Use the original email ID you used earlier. For new lines, don't use double slash n. Use a single slash n. In the message, say that you are subscribed to the newsletter, and will be forwarding the best deals that align with the user's interests in the future.
-        
+        2. Use 'Get all messages' tool to check for new emails
+        3. When you receive messages, first get their IDs from the messages.messages list returned by 'Get all messages'
+        4. Loop through each message and check message.subject and if the word Newsletter is in the subject use this email address to get the message content
+            - save this original message.from field - this is who you'll reply to later
+            - save this original message_id for replying later
+        5. When you find the Newsletter Signup Request message, read it by calling 'Get message content' with the message ID.
+        6. DO NOT go to the substack website. Directly search the newsletter name + 'signup' in google and sign up for the top link
+        7. After signing up, there will be a second screen asking you to sign up to donate. Select the fourth option which means none. Then just click through skipping and then finally maybe later. Don't close the tab until you see the confirmation that you are subscribed.'
+        8. Be sure to not click the check box to confirm before clicking submit since it is already checked.
+        9. Use 'reply_to_message' tool to reply to the newsletter signup request message saying you succesfully signed up and will keep the user updated with everything they requested to be kept to up to date with. Use the original message ID you used earlier. For new lines, don't use double slash n. Use a single slash n. In the message, say that you are subscribed to the newsletter, and will be forwarding the best deals that align with the user's interests in the future.
+            - Use ONLY inbox_id and message_id parameters from the newsletter signup request when replying
+            - make sure to reply to the original sender
+            - DO NOT reply to the welcome email or your own inbox. 
+            - Include a confirmation message about the subscription        
+            - use the newsletter signup request messages message.from as the to address here. It should never be your own. And you shouldn't you assume and create one.
         Your goal is to:
         1. Monitor your inbox for a Newsletter Signup Request email
         2. When found, sign up for the requested fashion brand newsletters
-        3. Reply with a kind email using the reply_to_email tool with the original email ID and titled 'Best Promotions' including a summary of each of the brands emails.
-
+        3. Reply with a kind email using the reply_to_message tool with the original message ID. and titled 'Best Promotions' including a summary of the newsletter on LLMs.
         
         Remember: You must ONLY interact with emails through the provided tools.
         Example workflow:
-        1. emails = Get all emails
-        2. if emails.emails exists and has items:
-           - email_id = emails.emails[0].id
-           - Use 'Get specific email' with email_id to read it
+        1. messages = Get all messages
+        2. if messages.messages exists and has items:
+           - message_id = messages.messages[0].message_id
+           - Use 'Get specific message' with message_id to read it
         
-        Remember: Never call 'Get all emails' repeatedly without processing the results.
+        Remember: Never call 'Get all messages' repeatedly without processing the results.
         """,
             llm=llm,
             use_vision=True, 
@@ -99,88 +110,85 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-load_dotenv()
 
+client = AgentMail(api_key=os.getenv("AGENTMAIL_PROD_API_KEY"))
 
-client = AgentMail(base_url="https://api.agentmail.to/v0", api_key=os.getenv("AGENTMAIL_PROD_API_KEY"))
-
-@controller.action('Create new email inbox')
-def create_inbox(username: Optional[str] = None) -> str:
-    result = client.create_inbox(username)
+@controller.action('Create new inbox')
+def create_inbox() -> str:
+    result = client.inboxes.create()
     return f"Created inbox: {result.address}"
 
-@controller.action('Delete email inbox')
-def delete_inbox(address: str) -> str:
-    result = client.delete_inbox(address)
-    return f"Deleted inbox: {address}"
+@controller.action('Delete inbox')
+def delete_inbox(inbox_id: str) -> str:
+    client.inboxes.delete(inbox_id=inbox_id)
+    return f"Deleted inbox: {inbox_id}"
 
-@controller.action('Get all emails from inbox')
-def get_emails(address: str) -> str:
-    emails = client.get_emails(address)
-    if not emails.emails:
-        return "No emails found in inbox"
+@controller.action('Get all messages from inbox')
+def get_messages(inbox_id: str) -> str:
+    messages = client.messages.list(
+        inbox_id=inbox_id,
+       
+    )
+    if not messages.messages:
+        return "No messages found in inbox"
     
-    email_ids = [email.id for email in emails.emails]
-    return f"Retrieved {len(emails.emails)} emails from {address} with IDs: {email_ids}"
+    message_ids = []
+    for msg in messages.messages:
+        message_ids.append(msg.message_id)
+    return f"Retrieved {len(message_ids)} messages from {inbox_id} with IDs: {message_ids}"
 
-@controller.action('Get specific email by ID')
-def get_email(address: str, id: str) -> str:
-    email = client.get_email(address, id)
-    return f"Retrieved email: {email.subject}"
+@controller.action('Get message by ID')
+def get_message(inbox_id: str, message_id: str) -> str:
+    message = client.messages.get(inbox_id = inbox_id, message_id=message_id)
+    return f"Retrieved message: {message.subject}"
 
-@controller.action('Get email content')
-def get_email_content(address: str, id: str) -> str:
-    email = client.get_email(address, id)
-    return f"Retrieved email content: {email.text}"
+@controller.action('Get message content')
+def get_message(inbox_id: str, message_id: str) -> str:
+    message = client.messages.get(inbox_id = inbox_id, message_id=message_id)
+    return f"Retrieved message: {message.text}"
 
-@controller.action('Get all sent emails')
-def get_sent_emails(address: str) -> str:
-    emails = client.get_sent_emails(address)
-    print(emails)
-    return f"Retrieved {len(emails.emails)} sent emails from {address}"
-
-@controller.action('Get specific sent email')
-def get_sent_email(address: str, id: str) -> str:
-    email = client.get_sent_email(address, id)
-    return f"Retrieved sent email: {email.subject}"
-
-@controller.action('Send new email')
-def send_email( address: str, to: Optional[List[str]] = None, cc: Optional[List[str]] = None, bcc: Optional[List[str]] = None, subject: Optional[str] = None, text: Optional[str] = None
-):
-    client.send_email(
-        address,
-        to=to,
-        cc=cc,
-        bcc=bcc,
-        subject=subject,
-        text=text
-    )
-    return f"Sent email from {address} to {to}"
-
-@controller.action('Reply to existing email')
-def reply_to_email(address: str,
-    id: str,
-    to: Optional[List[str]] = None,
-    cc: Optional[List[str]] = None,
-    bcc: Optional[List[str]] = None,
+@controller.action('Send new message')
+def send_message(
+    inbox_id: str,
+    to: List[str],
     subject: Optional[str] = None,
-    text: Optional[str] = None,):
-    client.reply_to_email(
-        address,
-        id,
+    text: Optional[str] = None,
+    html: Optional[str] = None,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None
+):
+    
+    client.messages.send(
+        inbox_id=inbox_id,
         to=to,
-        cc=cc,
-        bcc=bcc,
-        subject=subject,
-        text=text
+        subject=subject or "",
+        text=text or "",
+        html=html or "",
+        cc=cc or [],
+        bcc=bcc or []
     )
-    return f"Replied to email {id} from {address}"
+    return f"Sent message from {inbox_id} to {to}"
 
-@controller.action('Sign up for newsletter', requires_browser=True)
-async def sign_up_newsletter(email: str, website: str, browser: Browser) -> str:
-    page = browser.get_current_page()
-    await page.goto(website)
-    return f"Signed up for newsletter at {website} using {email}"
+@controller.action('Reply to message')
+def reply_to_message(
+    inbox_id: str,
+    message_id: str,
+    text: Optional[str] = None,
+    html: Optional[str] = None,
+    to: Optional[str] = None,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None
+):
+    client.messages.reply(
+        inbox_id=inbox_id,
+        message_id=message_id,
+        text=text or "",
+        html=html or "",
+        to=to or "",
+        cc=cc or [],
+        bcc=bcc or [],
+    )
+    return f"Replied to message {message_id}"
 
 @app.websocket("/ws/{email_address}")
 async def websocket_endpoint(websocket: WebSocket, email_address: str):
@@ -207,20 +215,6 @@ async def websocket_endpoint(websocket: WebSocket, email_address: str):
     finally:
         await email_manager.disconnect(email_address)
 
-# # HTTP endpoint to manually start monitoring an email
-# @app.post("/monitor/{email_address}")
-# async def start_monitoring(email_address: str):
-#     # Initial run of the agent
-#     if email_address in email_manager.agents:
-#         agent = email_manager.agents[email_address]
-#         await agent.run()
-#     return {"status": "monitoring_started", "email": email_address}
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-        
-
-# brands = ['Louis Vuitton', 'Baccarat', 'Givenchy']
-# email = 'testbrands@agentmail.to'
-
